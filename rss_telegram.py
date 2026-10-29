@@ -9,6 +9,7 @@ import requests
 import asyncio
 from telegram import Bot
 from telegram.constants import ParseMode
+from translator import translate_to_persian
 import re
 import html
 
@@ -23,13 +24,13 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', 3600))  # Default: 1 hour
-FEEDS_FILE = os.environ.get('FEEDS_FILE', '/app/data/feeds.txt')
+FEEDS_FILE = os.environ.get('FEEDS_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'feeds.txt'))
 INCLUDE_DESCRIPTION = os.environ.get('INCLUDE_DESCRIPTION', 'false').lower() == 'true'  # Default: false
 DISABLE_NOTIFICATION = os.environ.get('DISABLE_NOTIFICATION', 'false').lower() == 'true'  # Default: false
 MAX_MESSAGE_LENGTH = 4096  # Maximum character limit for Telegram messages
 
 # File to store already sent articles
-HISTORY_FILE = "/app/data/sent_items.json"
+HISTORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "sent_items.json")
 
 
 def strip_html(html_content: str) -> str:
@@ -86,11 +87,14 @@ async def send_telegram_message(bot, chat_id, message):
         logger.error(f"Error sending notification: {e}")
         return False
 
+
 async def send_grouped_messages(bot, messages_by_feed):
-    """Send messages grouped by feed."""
+    """Send translated messages and record only successfully sent articles."""
+    sent_items = load_sent_items()
+
     if not messages_by_feed:
         logger.info("No new content to notify")
-        return True
+        return sent_items
 
     for feed_title, entries in messages_by_feed.items():
         if not entries:
@@ -98,33 +102,62 @@ async def send_grouped_messages(bot, messages_by_feed):
 
         header = f"📢 *New content from {feed_title}*\n\n"
         entries_text = ""
+        batch_entries = []
+
+        async def flush_batch():
+            nonlocal entries_text, batch_entries, sent_items
+
+            if not entries_text or not batch_entries:
+                return
+
+            success = await send_telegram_message(
+                bot, TELEGRAM_CHAT_ID, header + entries_text
+            )
+
+            if success:
+                for item in batch_entries:
+                    feed_url = item["feed_url"]
+                    entry_id = item["entry_id"]
+                    sent_items.setdefault(feed_url, [])
+
+                    if entry_id not in sent_items[feed_url]:
+                        sent_items[feed_url].append(entry_id)
+
+                save_sent_items(sent_items)
+
+            entries_text = ""
+            batch_entries = []
 
         for entry in entries:
-            entry_text = f"• *{entry['title']}*\n"
+            title = entry["title"].replace("*", "\\*").replace("_", "\\_")
+            entry_text = f"• *{title}*\n"
 
-            if INCLUDE_DESCRIPTION and entry.get('description'):
-                desc = strip_html(entry['description'])
+            if INCLUDE_DESCRIPTION and entry.get("description"):
+                desc = entry["description"].replace("*", "\\*").replace("_", "\\_")
                 if len(desc) > 150:
-                    desc = desc[:147] + '...'
+                    desc = desc[:147] + "..."
                 entry_text += f"  _{desc}_\n"
 
             entry_text += f"\n  {entry['link']}\n\n"
 
             if len(header) + len(entries_text) + len(entry_text) > MAX_MESSAGE_LENGTH:
-                await send_telegram_message(bot, TELEGRAM_CHAT_ID, header + entries_text)
-                entries_text = entry_text
-            else:
-                entries_text += entry_text
+                await flush_batch()
 
-        if entries_text:
-            await send_telegram_message(bot, TELEGRAM_CHAT_ID, header + entries_text)
+            if len(header) + len(entry_text) > MAX_MESSAGE_LENGTH:
+                logger.warning("Skipping an article that exceeds Telegram's message limit")
+                continue
 
+            entries_text += entry_text
+            batch_entries.append(entry)
+
+        await flush_batch()
         await asyncio.sleep(1)
 
-    return True
+    return sent_items
+
 
 async def check_feeds(bot):
-    """Check RSS feeds for new articles."""
+    """Check RSS feeds for new articles and translate them."""
     sent_items = load_sent_items()
     feeds = load_feeds()
 
@@ -138,57 +171,84 @@ async def check_feeds(bot):
         if not feed_url.strip():
             continue
 
-        logger.info(f"Checking feed: {feed_url}")
+        logger.info("Checking feed: %s", feed_url)
 
         try:
             feed = feedparser.parse(feed_url)
 
             if not feed.entries:
-                logger.warning(f"No entries found in feed: {feed_url}")
+                logger.warning("No entries found in feed: %s", feed_url)
                 continue
 
-            feed_title = feed.feed.title if hasattr(feed.feed, 'title') else feed_url
+            feed_title = getattr(feed.feed, "title", feed_url)
             sent_items.setdefault(feed_url, [])
             messages_by_feed.setdefault(feed_title, [])
 
             for entry in feed.entries:
-                entry_id = entry.id if hasattr(entry, 'id') else entry.link
-                if entry_id in sent_items[feed_url]:
+                entry_id = getattr(entry, "id", None) or getattr(entry, "link", None)
+                if not entry_id or entry_id in sent_items[feed_url]:
                     continue
 
-                title = entry.title if hasattr(entry, 'title') else "No title"
-                link = entry.link if hasattr(entry, 'link') else ""
+                title = getattr(entry, "title", "No title")
+                link = getattr(entry, "link", "")
                 description = ""
+
                 if INCLUDE_DESCRIPTION:
-                    description = getattr(entry, 'description', '') or getattr(entry, 'summary', '')
+                    description = (
+                        getattr(entry, "description", "")
+                        or getattr(entry, "summary", "")
+                    )
+                    description = strip_html(description)
 
-                messages_by_feed[feed_title].append({'title': title, 'link': link, 'description': description})
-                sent_items[feed_url].append(entry_id)
-        except Exception as e:
-            logger.error(f"Error checking feed {feed_url}: {e}")
+                translated_title = translate_to_persian(title)
+                translated_description = (
+                    translate_to_persian(description)
+                    if INCLUDE_DESCRIPTION and description
+                    else description
+                )
 
-    await send_grouped_messages(bot, messages_by_feed)
-    return sent_items
+                messages_by_feed[feed_title].append({
+                    "title": translated_title,
+                    "link": link,
+                    "description": translated_description,
+                    "entry_id": entry_id,
+                    "feed_url": feed_url,
+                })
+
+        except Exception as error:
+            logger.error("Error checking feed %s: %s", feed_url, error)
+
+    return await send_grouped_messages(bot, messages_by_feed)
 
 async def main_async():
     logger.info("Starting RSS feed monitoring")
-    logger.info(f"Configuration: INCLUDE_DESCRIPTION={INCLUDE_DESCRIPTION}, DISABLE_NOTIFICATION={DISABLE_NOTIFICATION}")
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Missing environment variables. Make sure to set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        logger.error("Missing Telegram environment variables")
         return
 
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    await send_telegram_message(
-        bot, TELEGRAM_CHAT_ID,
-        "🤖 *RSS Monitoring Bot started!*\nActive feed monitoring. Configuration loaded from file."
-    )
+    await bot.initialize()
 
-    while True:
-        sent_items = await check_feeds(bot)
-        save_sent_items(sent_items)
-        logger.info(f"Next check in {CHECK_INTERVAL} seconds")
-        await asyncio.sleep(CHECK_INTERVAL)
+    try:
+        if os.environ.get("RUN_ONCE", "false").lower() == "true":
+            logger.info("Running one scheduled check")
+            await check_feeds(bot)
+            logger.info("Scheduled check completed")
+            return
+
+        await send_telegram_message(
+            bot, TELEGRAM_CHAT_ID,
+            "🤖 *RSS Monitoring Bot started!\nActive feed monitoring."
+        )
+
+        while True:
+            await check_feeds(bot)
+            logger.info(f"Next check in {CHECK_INTERVAL} seconds")
+            await asyncio.sleep(CHECK_INTERVAL)
+
+    finally:
+        await bot.shutdown()
 
 
 def main():

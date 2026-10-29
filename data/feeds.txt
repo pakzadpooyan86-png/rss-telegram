@@ -1,1 +1,10 @@
-https://feeds.example.com/rss
+https://www.irib-news.ir/fa/rss/allnews?
+https://www.isna.ir/rss
+https://www.mehrnews.com/rss
+https://www.khabaronline.ir/rss
+https://feeds.bbci.co.uk/news/world/rss.xml
+https://www.aljazeera.com/xml/rss/all.xml
+https://www.theguardian.com/world/rss
+https://www.theverge.com/rss/index.xml
+https://techcrunch.com/feed/
+https://feeds.arstechnica.com/arstechnica/index

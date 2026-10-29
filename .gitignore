@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+
+*.backup
+*.backup*
+*.bak
+.env
+__pycache__/
+*.pyc
