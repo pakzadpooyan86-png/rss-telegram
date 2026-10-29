@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import os
+import sys
+import getpass
 import time
 import json
 import logging
@@ -20,9 +22,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Prevent Telegram API URLs containing bot tokens from appearing in logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # Get environment variables
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if sys.stdin.isatty():
+        TELEGRAM_BOT_TOKEN = TELEGRAM_BOT_TOKEN or getpass.getpass("Telegram Bot Token: ")
+        TELEGRAM_CHAT_ID = TELEGRAM_CHAT_ID or input("Telegram Chat ID: ").strip()
+    else:
+        raise RuntimeError("Missing Telegram credentials. Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.")
 CHECK_INTERVAL = int(os.environ.get('CHECK_INTERVAL', 3600))  # Default: 1 hour
 FEEDS_FILE = os.environ.get('FEEDS_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data', 'feeds.txt'))
 INCLUDE_DESCRIPTION = os.environ.get('INCLUDE_DESCRIPTION', 'false').lower() == 'true'  # Default: false
@@ -156,6 +169,44 @@ async def send_grouped_messages(bot, messages_by_feed):
     return sent_items
 
 
+def fetch_feed(url):
+    """Fetch an RSS feed with timeout and retry handling."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; RSSReader/1.0)"
+    }
+
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=(10, 20)
+            )
+            response.raise_for_status()
+
+            feed = feedparser.parse(response.content)
+
+            if not feed.entries:
+                logger.warning(
+                    "Feed returned no entries: %s | HTTP %s",
+                    url, response.status_code
+                )
+
+            return feed
+
+        except requests.RequestException as error:
+            logger.warning(
+                "Feed attempt %s/3 failed: %s | %s",
+                attempt + 1, url, error
+            )
+
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+
+    logger.error("Feed unavailable after 3 attempts: %s", url)
+    return feedparser.parse("")
+
+
 async def check_feeds(bot):
     """Check RSS feeds for new articles and translate them."""
     sent_items = load_sent_items()
@@ -174,7 +225,7 @@ async def check_feeds(bot):
         logger.info("Checking feed: %s", feed_url)
 
         try:
-            feed = feedparser.parse(feed_url)
+            feed = fetch_feed(feed_url)
 
             if not feed.entries:
                 logger.warning("No entries found in feed: %s", feed_url)
